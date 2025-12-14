@@ -28,6 +28,24 @@ class MainActivity : AppCompatActivity() {
     private lateinit var preferencesManager: PreferencesManager
     private lateinit var wifiHelper: WifiHelper
     private lateinit var networkAdapter: NetworkAdapter
+    
+    // Store pending network for after PIN verification
+    private var pendingNetwork: WifiHelper.WifiNetwork? = null
+    
+    private val verifyPinLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == PinActivity.RESULT_PIN_VERIFIED) {
+            pendingNetwork?.let { network ->
+                if (network.isSecure) {
+                    showPasswordDialog(network)
+                } else {
+                    savePreferredNetwork(network.ssid, null)
+                }
+            }
+        }
+        pendingNetwork = null
+    }
 
     private val requiredPermissions = mutableListOf(
         Manifest.permission.ACCESS_FINE_LOCATION,
@@ -39,9 +57,7 @@ class MainActivity : AppCompatActivity() {
             add(Manifest.permission.NEARBY_WIFI_DEVICES)
             add(Manifest.permission.POST_NOTIFICATIONS)
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            add(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
-        }
+        // Note: ACCESS_BACKGROUND_LOCATION must be requested separately after foreground location is granted
     }
 
     private val permissionLauncher = registerForActivityResult(
@@ -49,14 +65,56 @@ class MainActivity : AppCompatActivity() {
     ) { permissions ->
         val allGranted = permissions.all { it.value }
         if (allGranted) {
-            scanNetworks()
+            // Check if we still need background location
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+                ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_BACKGROUND_LOCATION) 
+                != PackageManager.PERMISSION_GRANTED) {
+                requestBackgroundLocation()
+            } else {
+                scanNetworks()
+            }
         } else {
-            Toast.makeText(
-                this,
-                "Permissions required to scan WiFi networks",
-                Toast.LENGTH_LONG
-            ).show()
+            // Check if at least location is granted
+            val locationGranted = ContextCompat.checkSelfPermission(
+                this, Manifest.permission.ACCESS_FINE_LOCATION
+            ) == PackageManager.PERMISSION_GRANTED
+            
+            if (locationGranted) {
+                // Can still scan with foreground location
+                scanNetworks()
+            } else {
+                AlertDialog.Builder(this)
+                    .setTitle("Location Permission Required")
+                    .setMessage("WiFi scanning requires Location permission.\n\nPlease go to Settings → Apps → ForceNetwork → Permissions → Location and select 'Allow all the time' for best experience.")
+                    .setPositiveButton("Open Settings") { _, _ ->
+                        openAppSettings()
+                    }
+                    .setNegativeButton("Cancel", null)
+                    .show()
+            }
         }
+    }
+    
+    private fun requestBackgroundLocation() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            AlertDialog.Builder(this)
+                .setTitle("Background Location")
+                .setMessage("For automatic network switching to work when the app is closed, please select 'Allow all the time' on the next screen.")
+                .setPositiveButton("Continue") { _, _ ->
+                    permissionLauncher.launch(arrayOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION))
+                }
+                .setNegativeButton("Skip") { _, _ ->
+                    scanNetworks()
+                }
+                .show()
+        }
+    }
+    
+    private fun openAppSettings() {
+        val intent = Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+            data = android.net.Uri.fromParts("package", packageName, null)
+        }
+        startActivity(intent)
     }
 
     private val pinActivityLauncher = registerForActivityResult(
@@ -66,6 +124,14 @@ class MainActivity : AppCompatActivity() {
             PinActivity.RESULT_PIN_VERIFIED, PinActivity.RESULT_PIN_SET -> {
                 // PIN verified or set, open settings
                 startActivity(Intent(this, SettingsActivity::class.java))
+            }
+        }
+    }
+
+    private val serviceStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == NetworkMonitorService.ACTION_SERVICE_STATE_CHANGED) {
+                updateStatus()
             }
         }
     }
@@ -98,14 +164,27 @@ class MainActivity : AppCompatActivity() {
         updateStatus()
         
         // Register for scan results
-        val filter = IntentFilter(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION)
-        registerReceiver(wifiScanReceiver, filter)
+        val scanFilter = IntentFilter(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(wifiScanReceiver, scanFilter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(wifiScanReceiver, scanFilter)
+        }
+        
+        // Register for service state changes
+        val serviceFilter = IntentFilter(NetworkMonitorService.ACTION_SERVICE_STATE_CHANGED)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(serviceStateReceiver, serviceFilter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(serviceStateReceiver, serviceFilter)
+        }
     }
 
     override fun onPause() {
         super.onPause()
         try {
             unregisterReceiver(wifiScanReceiver)
+            unregisterReceiver(serviceStateReceiver)
         } catch (e: Exception) {
             // Receiver not registered
         }
@@ -181,22 +260,20 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun requestPermissions() {
-        // Check for background location separately on Android 10+
         val permissionsToRequest = requiredPermissions.filter {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
         }
 
         if (permissionsToRequest.isNotEmpty()) {
-            // Request foreground permissions first
-            val foregroundPermissions = permissionsToRequest.filter {
-                it != Manifest.permission.ACCESS_BACKGROUND_LOCATION
-            }
-            
-            if (foregroundPermissions.isNotEmpty()) {
-                permissionLauncher.launch(foregroundPermissions.toTypedArray())
-            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                // Request background location separately
-                permissionLauncher.launch(arrayOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION))
+            permissionLauncher.launch(permissionsToRequest.toTypedArray())
+        } else {
+            // All foreground permissions granted, check background location
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+                ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_BACKGROUND_LOCATION) 
+                != PackageManager.PERMISSION_GRANTED) {
+                requestBackgroundLocation()
+            } else {
+                scanNetworks()
             }
         }
     }
@@ -252,20 +329,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun verifyPinAndSetNetwork(network: WifiHelper.WifiNetwork) {
+        pendingNetwork = network
         val intent = Intent(this, PinActivity::class.java).apply {
             putExtra(PinActivity.EXTRA_MODE, PinActivity.MODE_VERIFY)
         }
-        
-        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-            if (result.resultCode == PinActivity.RESULT_PIN_VERIFIED) {
-                // Show password dialog if network is secured
-                if (network.isSecure) {
-                    showPasswordDialog(network)
-                } else {
-                    savePreferredNetwork(network.ssid, null)
-                }
-            }
-        }.launch(intent)
+        verifyPinLauncher.launch(intent)
     }
 
     private fun showPasswordDialog(network: WifiHelper.WifiNetwork) {
@@ -330,19 +398,32 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        if (NetworkMonitorService.isRunning(this)) {
+        val wasRunning = NetworkMonitorService.isRunning(this)
+        
+        if (wasRunning) {
             NetworkMonitorService.stop(this)
+            Toast.makeText(this, "Service stopped", Toast.LENGTH_SHORT).show()
         } else {
             if (!checkPermissions()) {
                 requestPermissions()
                 return
             }
-            NetworkMonitorService.start(this)
+            try {
+                NetworkMonitorService.start(this)
+                Toast.makeText(this, "Service started", Toast.LENGTH_SHORT).show()
+            } catch (e: Exception) {
+                Toast.makeText(
+                    this,
+                    "Failed to start service: ${e.message}",
+                    Toast.LENGTH_LONG
+                ).show()
+                return
+            }
         }
 
-        // Update UI after a short delay
+        // Update UI after a short delay to allow service state to change
         binding.root.postDelayed({
             updateStatus()
-        }, 500)
+        }, 1000)
     }
 }

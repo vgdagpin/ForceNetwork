@@ -47,6 +47,7 @@ class NetworkMonitorService : Service() {
         const val ACTION_START = "com.forcenetwork.app.ACTION_START"
         const val ACTION_STOP = "com.forcenetwork.app.ACTION_STOP"
         const val ACTION_CHECK_NETWORK = "com.forcenetwork.app.ACTION_CHECK_NETWORK"
+        const val ACTION_SERVICE_STATE_CHANGED = "com.forcenetwork.app.SERVICE_STATE_CHANGED"
 
         fun start(context: Context) {
             val intent = Intent(context, NetworkMonitorService::class.java).apply {
@@ -137,11 +138,26 @@ class NetworkMonitorService : Service() {
         preferencesManager.setServiceEnabled(true)
 
         // Start foreground service with notification
-        startForeground(NOTIFICATION_ID, createNotification())
+        try {
+            startForeground(NOTIFICATION_ID, createNotification())
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start foreground service", e)
+            isMonitoring = false
+            preferencesManager.setServiceEnabled(false)
+            stopSelf()
+            return
+        }
 
-        // Register for scan results
+        // Register for scan results (with RECEIVER_NOT_EXPORTED for Android 13+)
         val filter = IntentFilter(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION)
-        registerReceiver(wifiScanReceiver, filter)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(wifiScanReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(wifiScanReceiver, filter)
+        }
+
+        // Broadcast service state change
+        sendBroadcast(Intent(ACTION_SERVICE_STATE_CHANGED))
 
         // Start periodic scanning
         handler.post(networkCheckRunnable)
@@ -167,6 +183,9 @@ class NetworkMonitorService : Service() {
         } catch (e: Exception) {
             Log.e(TAG, "Error unregistering receiver", e)
         }
+
+        // Broadcast service state change
+        sendBroadcast(Intent(ACTION_SERVICE_STATE_CHANGED))
 
         wifiHelper.disconnectNetworkCallback()
         stopForeground(STOP_FOREGROUND_REMOVE)
