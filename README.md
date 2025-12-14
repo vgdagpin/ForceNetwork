@@ -92,7 +92,16 @@ The app requires the following permissions:
 ### Prerequisites
 - Android Studio Hedgehog (2023.1.1) or later
 - JDK 17
-- Android SDK 34
+- Android SDK 35
+
+### Dependencies (Current Versions)
+| Component | Version |
+|-----------|---------|
+| Kotlin | 2.0.21 |
+| Android Gradle Plugin | 8.7.3 |
+| Gradle | 8.11.1 |
+| compileSdk/targetSdk | 35 |
+| minSdk | 26 |
 
 ### Build Steps
 1. Open the project in Android Studio
