@@ -35,6 +35,8 @@ class NetworkMonitorService : Service() {
     
     private var wakeLock: PowerManager.WakeLock? = null
     private var isMonitoring = false
+    private var isConnecting = false
+    private var lastConnectedSsid: String? = null
 
     private val scanInterval = 30_000L // 30 seconds
     private val reconnectDelay = 5_000L // 5 seconds
@@ -200,13 +202,22 @@ class NetworkMonitorService : Service() {
             return
         }
 
+        // Skip if already connecting
+        if (isConnecting) {
+            Log.d(TAG, "Already connecting, skipping check")
+            return
+        }
+
         val currentSsid = wifiHelper.getCurrentSsid()
         Log.d(TAG, "Current SSID: $currentSsid, Preferred: $preferredSsid")
 
         // Already connected to preferred network
         if (currentSsid == preferredSsid) {
             Log.d(TAG, "Already connected to preferred network")
-            updateNotification("Connected to $preferredSsid")
+            if (lastConnectedSsid != preferredSsid) {
+                lastConnectedSsid = preferredSsid
+                updateNotification("Connected to $preferredSsid")
+            }
             return
         }
 
@@ -224,40 +235,65 @@ class NetworkMonitorService : Service() {
         } else {
             Log.d(TAG, "Preferred network not in range")
             updateNotification("Waiting for $preferredSsid...")
+            lastConnectedSsid = null
         }
     }
 
     private fun connectToPreferredNetwork(ssid: String) {
+        if (isConnecting) {
+            Log.d(TAG, "Already connecting, ignoring request")
+            return
+        }
+        
+        isConnecting = true
         val password = preferencesManager.getNetworkPassword()
+        
+        // Use network suggestion for persistent connection (Android 10+)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val suggestionAdded = wifiHelper.addNetworkSuggestion(ssid, password)
+            Log.d(TAG, "Network suggestion added: $suggestionAdded")
+        }
         
         wifiHelper.connectToNetwork(ssid, password, object : WifiHelper.ConnectionCallback {
             override fun onSuccess(ssid: String) {
                 Log.d(TAG, "Successfully connected to $ssid")
+                isConnecting = false
+                lastConnectedSsid = ssid
                 updateNotification("Connected to $ssid")
             }
 
             override fun onFailure(reason: String) {
                 Log.e(TAG, "Failed to connect: $reason")
+                isConnecting = false
                 updateNotification("Connection failed: $reason")
                 
-                // Retry after delay
+                // Retry after delay (but only once)
                 handler.postDelayed({
-                    if (isMonitoring) {
-                        checkAndConnectToPreferredNetwork()
+                    if (isMonitoring && !isConnecting) {
+                        val currentSsid = wifiHelper.getCurrentSsid()
+                        if (currentSsid != ssid) {
+                            checkAndConnectToPreferredNetwork()
+                        }
                     }
                 }, reconnectDelay)
             }
 
             override fun onDisconnected() {
                 Log.d(TAG, "Disconnected from network")
-                updateNotification("Disconnected, reconnecting...")
+                isConnecting = false
                 
-                // Try to reconnect
-                handler.postDelayed({
-                    if (isMonitoring) {
-                        checkAndConnectToPreferredNetwork()
-                    }
-                }, reconnectDelay)
+                // Only try to reconnect if we were previously connected to the preferred network
+                // and are now disconnected (not just because of callback noise)
+                val currentSsid = wifiHelper.getCurrentSsid()
+                val preferredSsid = preferencesManager.getPreferredNetworkSsid()
+                
+                if (currentSsid != preferredSsid && lastConnectedSsid == preferredSsid) {
+                    lastConnectedSsid = null
+                    updateNotification("Disconnected, will reconnect...")
+                    
+                    // Don't immediately reconnect - let the periodic check handle it
+                    // This prevents the reconnection loop
+                }
             }
         })
     }

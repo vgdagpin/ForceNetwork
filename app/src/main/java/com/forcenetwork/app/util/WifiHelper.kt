@@ -132,6 +132,13 @@ class WifiHelper(private val context: Context) {
     @SuppressLint("MissingPermission")
     fun connectToNetwork(ssid: String, password: String?, callback: ConnectionCallback) {
         Log.d(TAG, "Attempting to connect to: $ssid")
+        
+        // Check if already connected to this network
+        if (isConnectedTo(ssid)) {
+            Log.d(TAG, "Already connected to $ssid")
+            callback.onSuccess(ssid)
+            return
+        }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             connectUsingNetworkRequest(ssid, password, callback)
@@ -162,24 +169,36 @@ class WifiHelper(private val context: Context) {
             .setNetworkSpecifier(networkSpecifier)
             .build()
 
+        var hasCalledBack = false
+
         networkCallback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 super.onAvailable(network)
-                Log.d(TAG, "Network available: $ssid")
-                connectivityManager.bindProcessToNetwork(network)
-                callback.onSuccess(ssid)
+                if (!hasCalledBack) {
+                    hasCalledBack = true
+                    Log.d(TAG, "Network available: $ssid")
+                    connectivityManager.bindProcessToNetwork(network)
+                    callback.onSuccess(ssid)
+                }
             }
 
             override fun onUnavailable() {
                 super.onUnavailable()
-                Log.d(TAG, "Network unavailable: $ssid")
-                callback.onFailure("Network unavailable")
+                if (!hasCalledBack) {
+                    hasCalledBack = true
+                    Log.d(TAG, "Network unavailable: $ssid")
+                    callback.onFailure("Network unavailable")
+                }
             }
 
             override fun onLost(network: Network) {
                 super.onLost(network)
                 Log.d(TAG, "Network lost: $ssid")
-                callback.onDisconnected()
+                // Only call onDisconnected if we successfully connected before
+                // and check if we're actually disconnected from this network
+                if (hasCalledBack && !isConnectedTo(ssid)) {
+                    callback.onDisconnected()
+                }
             }
         }
 
